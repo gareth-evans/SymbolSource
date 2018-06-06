@@ -12,6 +12,4 @@ namespace SymbolSource.Contract.Tests
 
         protected override IStorageService Storage { get; }
     }
-
-
 }

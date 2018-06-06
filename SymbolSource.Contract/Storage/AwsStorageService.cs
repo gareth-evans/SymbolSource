@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net;
@@ -8,6 +9,7 @@ using System.Threading.Tasks;
 using Amazon;
 using Amazon.DynamoDBv2;
 using Amazon.DynamoDBv2.DocumentModel;
+using Amazon.DynamoDBv2.Model;
 using Amazon.Runtime.Internal;
 using Amazon.S3;
 using Amazon.S3.Model;
@@ -47,9 +49,10 @@ namespace SymbolSource.Contract.Storage.Aws
             };
 
             var packageTable = new PackageTable(dynamoConfig, tableName);
+            var packageBucket = new PackageBucket(s3Config, bucketName);
 
-            return new AwsStorageFeed(bucketName, packageTable, bucketName, s3Config, dynamoConfig);
-        }
+            return new AwsStorageFeed(bucketName, packageTable, packageBucket, s3Config, dynamoConfig);
+        } 
 
         public IEnumerable<string> QueryFeeds()
         {
@@ -99,14 +102,19 @@ namespace SymbolSource.Contract.Storage.Aws
     public class AwsStorageFeed : IStorageFeed
     {
         private readonly PackageTable _table;
-        private readonly string _bucketName;
+        private readonly PackageBucket _bucket;
         private readonly AmazonS3Config _s3Config;
         private readonly AmazonDynamoDBConfig _dynamoConfig;
 
-        public AwsStorageFeed(string feedName, PackageTable table, string bucketName, AmazonS3Config s3Config, AmazonDynamoDBConfig dynamoConfig)
+        public AwsStorageFeed(
+            string feedName, 
+            PackageTable table, 
+            PackageBucket bucket, 
+            AmazonS3Config s3Config, 
+            AmazonDynamoDBConfig dynamoConfig)
         {
             _table = table;
-            _bucketName = bucketName;
+            _bucket = bucket;
             _s3Config = s3Config;
             _dynamoConfig = dynamoConfig;
             Name = feedName;
@@ -118,7 +126,7 @@ namespace SymbolSource.Contract.Storage.Aws
         {
             using (var client = new AmazonS3Client(_s3Config))
             {
-                var objects = client.ListObjects(_bucketName);
+                var objects = client.ListObjects(_bucket.Name);
 
                 return objects.S3Objects.Select(o => string.Join("/", o.Key.Split('/').Skip(2)));
             }
@@ -146,7 +154,7 @@ namespace SymbolSource.Contract.Storage.Aws
 
         public IPackageStorageItem GetPackage(string userName, PackageState packageState, PackageName packageName)
         {
-            return new AwsPackageStorageItem(this, packageName, packageState, _table, _bucketName, _s3Config, _dynamoConfig, userName);
+            return new AwsPackageStorageItem(this, packageName, packageState, _table, _bucket, _s3Config, _dynamoConfig, userName);
         }
 
         public IPackageRelatedStorageItem GetSymbol(PackageName packageName, SymbolName symbolName)
@@ -159,16 +167,23 @@ namespace SymbolSource.Contract.Storage.Aws
             throw new NotImplementedException();
         }
 
-        public Task<bool> Delete()
+        public async Task<bool> Delete()
         {
-            throw new NotImplementedException();
+            //delete table
+            var tableExisted = await _table.DeleteIfExistsAsync();
+
+            //delete bucket
+            var bucketExsisted = await _bucket.DeleteIfExistsAsync();
+
+            Debug.Assert(tableExisted == bucketExsisted);
+
+            return tableExisted || bucketExsisted;
         }
     }
 
     public class AwsPackageStorageItem : IPackageStorageItem
     {
         private readonly PackageTable _table;
-        private readonly string _bucketName;
         private readonly PackageBucket _bucket;
         private readonly AmazonS3Config _s3Config;
         private readonly AmazonDynamoDBConfig _dynamoConfig;
@@ -179,17 +194,16 @@ namespace SymbolSource.Contract.Storage.Aws
             PackageName name,
             PackageState state,
             PackageTable table,
-            string bucketName,
+            PackageBucket bucket,
             AmazonS3Config s3Config,
             AmazonDynamoDBConfig dynamoConfig,
             string username)
         {
             _table = table;
-            _bucketName = bucketName;
+            _bucket = bucket;
             _s3Config = s3Config;
             _dynamoConfig = dynamoConfig;
             _username = username;
-            _bucket = new PackageBucket(bucketName, s3Config);
 
             Feed = feed;
             Name = name;
@@ -208,7 +222,7 @@ namespace SymbolSource.Contract.Storage.Aws
             {
                 var key = GetPath(State, _username, Name);
 
-                var response = await client.ListObjectsAsync(_bucketName, key);
+                var response = await client.ListObjectsAsync(_bucket.Name, key);
 
                 return response.S3Objects.SingleOrDefault(x => x.Key == key) != null;
             }
@@ -225,7 +239,7 @@ namespace SymbolSource.Contract.Storage.Aws
             {
                 try
                 {
-                    var obj = await client.GetObjectAsync(_bucketName, GetPath(State, _username, Name));
+                    var obj = await client.GetObjectAsync(_bucket.Name, GetPath(State, _username, Name));
 
                     return obj.ResponseStream;
                 }
@@ -240,10 +254,10 @@ namespace SymbolSource.Contract.Storage.Aws
         {
             using (var client = new AmazonS3Client(_s3Config))
             {
-                await client.PutBucketAsync(_bucketName);
+                await client.PutBucketAsync(_bucket.Name);
             }
 
-            return new WriteS3ObjectOnDisposeStream(_s3Config, _bucketName, GetPath(State, _username, Name));
+            return new WriteS3ObjectOnDisposeStream(_s3Config, _bucket.Name, GetPath(State, _username, Name));
         }
 
         public Task Get(Stream target)
@@ -266,12 +280,12 @@ namespace SymbolSource.Contract.Storage.Aws
             {
                 using (var client = new AmazonS3Client(_s3Config))
                 {
-                    var response = await client.DeleteObjectAsync(_bucketName, GetPath(State, _username, Name));
+                    var response = await client.DeleteObjectAsync(_bucket.Name, GetPath(State, _username, Name));
 
                     return response.HttpStatusCode == HttpStatusCode.NoContent;
                 }
             }
-            catch (AmazonS3Exception ex) when (ex.ErrorCode == "NoSuchBucket" || ex.ErrorCode == "NoSuchCode")
+            catch (AmazonS3Exception ex) when (ex.ErrorCode == "NoSuchBucket" || ex.ErrorCode == "NoSuchKey")
             {
                 return false;
             }
@@ -351,7 +365,7 @@ namespace SymbolSource.Contract.Storage.Aws
 
         private Task<AwsPackageStorageItem> PrepareMoveOrCopy(PackageState newState, PackageName newName)
         {
-            var newPackage = new AwsPackageStorageItem(Feed, newName, newState, _table, _bucketName, _s3Config, _dynamoConfig, _username);
+            var newPackage = new AwsPackageStorageItem(Feed, newName, newState, _table, _bucket, _s3Config, _dynamoConfig, _username);
 
             return Task.FromResult(newPackage);
         }
@@ -360,12 +374,12 @@ namespace SymbolSource.Contract.Storage.Aws
     public class PackageTable
     {
         private readonly AmazonDynamoDBConfig _config;
-        private readonly string _tableName;
+        public string TableName { get; }
 
         public PackageTable(AmazonDynamoDBConfig config, string tableName)
         {
             _config = config;
-            _tableName = tableName;
+            TableName = tableName;
         }
 
         public async Task<Document> RetrieveAsync(PackageState packageState, PackageName packageName)
@@ -375,10 +389,27 @@ namespace SymbolSource.Contract.Storage.Aws
 
             using (var client = new AmazonDynamoDBClient(_config))
             {
-                var table = Table.LoadTable(client, _tableName);
+                var table = Table.LoadTable(client, TableName);
                 var document = await table.GetItemAsync(partitionKey, rangeKey);
 
                 return document;
+            }
+        }
+
+        public async Task<bool> DeleteIfExistsAsync()
+        {
+            using (var client = new AmazonDynamoDBClient(_config))
+            {
+                try
+                {
+                    var response = await client.DeleteTableAsync(TableName);
+
+                    return response.HttpStatusCode == HttpStatusCode.OK;
+                }
+                catch (ResourceNotFoundException)
+                {
+                    return false;
+                }
             }
         }
 
@@ -402,7 +433,7 @@ namespace SymbolSource.Contract.Storage.Aws
     {
         private readonly AmazonS3Config _config;
 
-        public PackageBucket(string bucketName, AmazonS3Config config)
+        public PackageBucket(AmazonS3Config config, string bucketName)
         {
             Name = bucketName;
             _config = config;
@@ -420,6 +451,23 @@ namespace SymbolSource.Contract.Storage.Aws
                     .SingleOrDefault(b => b.BucketName == Name);
 
                 return bucket != null;
+            }
+        }
+
+        public async Task<bool> DeleteIfExistsAsync()
+        {
+            try
+            {
+                using (var client = new AmazonS3Client(_config))
+                {
+                    var response = await client.DeleteBucketAsync(Name);
+
+                    return response.HttpStatusCode == HttpStatusCode.NoContent;
+                }
+            }
+            catch (AmazonS3Exception ex) when (ex.ErrorCode == "NoSuchBucket")
+            {
+                return false;
             }
         }
     }
