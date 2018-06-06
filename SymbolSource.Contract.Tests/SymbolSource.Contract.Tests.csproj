@@ -61,6 +61,7 @@
     </Reference>
   </ItemGroup>
   <ItemGroup>
+    <Compile Include="AwsStorageServiceTests.cs" />
     <Compile Include="AzureStorageServiceTests.cs" />
     <Compile Include="FileStorageServiceTests.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
