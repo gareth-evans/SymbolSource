@@ -52,7 +52,7 @@ namespace SymbolSource.Contract.Storage.Aws
             var packageBucket = new PackageBucket(s3Config, bucketName);
 
             return new AwsStorageFeed(bucketName, packageTable, packageBucket, s3Config, dynamoConfig);
-        } 
+        }
 
         public IEnumerable<string> QueryFeeds()
         {
@@ -107,10 +107,10 @@ namespace SymbolSource.Contract.Storage.Aws
         private readonly AmazonDynamoDBConfig _dynamoConfig;
 
         public AwsStorageFeed(
-            string feedName, 
-            PackageTable table, 
-            PackageBucket bucket, 
-            AmazonS3Config s3Config, 
+            string feedName,
+            PackageTable table,
+            PackageBucket bucket,
+            AmazonS3Config s3Config,
             AmazonDynamoDBConfig dynamoConfig)
         {
             _table = table;
@@ -246,16 +246,14 @@ namespace SymbolSource.Contract.Storage.Aws
                 catch (AmazonS3Exception ex) when (ex.ErrorCode == "NoSuchBucket" || ex.ErrorCode == "NoSuchKey")
                 {
                     return null;
-                } 
+                }
             }
         }
 
         public async Task<Stream> Put()
         {
-            using (var client = new AmazonS3Client(_s3Config))
-            {
-                await client.PutBucketAsync(_bucket.Name);
-            }
+            await _bucket.CreateIfNotExists();
+            await _table.CreateIfNotExists();
 
             return new WriteS3ObjectOnDisposeStream(_s3Config, _bucket.Name, GetPath(State, _username, Name));
         }
@@ -427,6 +425,53 @@ namespace SymbolSource.Contract.Storage.Aws
         {
             throw new NotImplementedException();
         }
+
+        public async Task CreateIfNotExists()
+        {
+            if (await Exists()) return;
+
+            using (var client = new AmazonDynamoDBClient(_config))
+            {
+                var attributeDefinitions = new List<AttributeDefinition> { new AttributeDefinition { AttributeName = "id", AttributeType = ScalarAttributeType.S } };
+                var keySchemaElements = new List<KeySchemaElement> { new KeySchemaElement { AttributeName = "id", KeyType = KeyType.HASH } };
+
+                var request = new CreateTableRequest
+                {
+                    TableName = TableName,
+                    AttributeDefinitions = attributeDefinitions,
+                    KeySchema = keySchemaElements,
+                    ProvisionedThroughput = new ProvisionedThroughput(5, 1)
+                };
+
+                await client.CreateTableAsync(request);
+
+                DescribeTableResponse describeTableResponse = null;
+
+                do
+                {
+                    describeTableResponse = await client.DescribeTableAsync(TableName);
+
+                } while (describeTableResponse.Table.TableStatus != TableStatus.ACTIVE);
+            }
+        }
+
+        public async Task<bool> Exists()
+        {
+            try
+            {
+                using (var client = new AmazonDynamoDBClient(_config))
+                {
+                    var response = await client.DescribeTableAsync(TableName);
+
+                    return true;
+                }
+            }
+            catch (ResourceNotFoundException)
+            {
+                return false;
+            }
+        }
+
     }
 
     public class PackageBucket
@@ -468,6 +513,14 @@ namespace SymbolSource.Contract.Storage.Aws
             catch (AmazonS3Exception ex) when (ex.ErrorCode == "NoSuchBucket")
             {
                 return false;
+            }
+        }
+
+        public async Task CreateIfNotExists()
+        {
+            using (var client = new AmazonS3Client(_config))
+            {
+                await client.PutBucketAsync(Name);
             }
         }
     }
