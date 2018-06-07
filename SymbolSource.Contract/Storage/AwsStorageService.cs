@@ -18,7 +18,7 @@ namespace SymbolSource.Contract.Storage.Aws
 {
     public class AwsStorageService : IStorageService
     {
-        private const string FeedPrefix = "feed-";
+        private const string FeedPrefix = "symbolsource-feed-";
         private const string NamedFeedPrefix = "named-";
         private const string DefaultFeedName = "default";
 
@@ -74,6 +74,8 @@ namespace SymbolSource.Contract.Storage.Aws
                 });
         }
 
+        private static readonly Regex BucketRegex = new Regex("[^A-Za-z0-9\\-\\.]", RegexOptions.Compiled);
+
         private static string GetBucketName(string feedName)
         {
             if (feedName != null)
@@ -88,10 +90,13 @@ namespace SymbolSource.Contract.Storage.Aws
                 feedName = DefaultFeedName;
 
             feedName = FeedPrefix + feedName;
-            return feedName;
+
+            return BucketRegex
+                .Replace(feedName, "")
+                .ToLower();
         }
 
-        private static readonly Regex TableRegex = new Regex("[^A-Za-z0-9]", RegexOptions.Compiled);
+        private static readonly Regex TableRegex = new Regex("[^A-Za-z0-9_\\-\\.]", RegexOptions.Compiled);
 
         private static string GetTableName(string containerName)
         {
