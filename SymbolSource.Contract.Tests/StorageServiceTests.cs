@@ -91,7 +91,7 @@ namespace SymbolSource.Contract.Tests
             Assert.True(await item.Delete());
             Assert.False(await item.Exists());
             Assert.Null(await item.Get());
-            Assert.False(await item.Delete());
+            Assert.False(await item.Delete(), "Result from Delete");
         }
 
         [Theory]
