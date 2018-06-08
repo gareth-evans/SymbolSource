@@ -3,7 +3,6 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
-using System.Linq.Expressions;
 using System.Net;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
@@ -11,9 +10,9 @@ using Amazon;
 using Amazon.DynamoDBv2;
 using Amazon.DynamoDBv2.DocumentModel;
 using Amazon.DynamoDBv2.Model;
-using Amazon.Runtime.Internal;
 using Amazon.S3;
 using Amazon.S3.Model;
+using Amazon.S3.Util;
 
 namespace SymbolSource.Contract.Storage.Aws
 {
@@ -145,7 +144,7 @@ namespace SymbolSource.Contract.Storage.Aws
 
         public Task<IEnumerable<PackageName>> QueryPackages(string userName, PackageState packageState)
         {
-            return Task.FromResult(Enumerable.Empty<PackageName>());
+            return _table.Query(userName, packageState);
         }
 
         public Task<IEnumerable<PackageName>> QueryPackages(PackageState packageState, string packageNamePrefix,
@@ -264,7 +263,7 @@ namespace SymbolSource.Contract.Storage.Aws
         {
             await PreparePut();
 
-            return new WriteS3ObjectOnDisposeStream(_s3Config, _bucket.Name, GetPath(State, await GetUserName(), Name));
+            return new WriteS3ObjectOnDisposeStream(_s3Config, _bucket.Name, GetPath(State, _userName, Name));
         }
 
         private async Task PreparePut()
@@ -272,10 +271,24 @@ namespace SymbolSource.Contract.Storage.Aws
             if (_userName == null)
                 throw new InvalidOperationException();
 
+            var document = await _table.RetrieveAsync(State, Name);
+
+            if (document != null)
+            {
+                if (document["UserName"] != _userName)
+                {
+                    await _bucket.DeleteObjectIfExistsAsync(GetPath(State, document["UserName"], Name));
+                }
+            }
+            else
+            {
+                document = new Document {["UserName"] = _userName};
+            }
+
             await _bucket.CreateIfNotExists();
             await _table.CreateIfNotExists();
 
-            var document = new Document {["UserName"] = _userName};
+            
 
             await _table.InsertOrReplaceAsync(State, Name, document);
         }
@@ -293,11 +306,9 @@ namespace SymbolSource.Contract.Storage.Aws
         public async Task<bool> Delete()
         {
             var objectDeleted = await _bucket.DeleteObjectIfExistsAsync(GetPath(State, await GetUserName(), Name));
+            var rowDeleted = await _table.DeleteRowIfExists(State, Name);
 
-            //delete dynamo row
-            var tableRowDelete = await _table.DeleteRowIfExists(State, Name);
-
-            return objectDeleted || tableRowDelete;
+            return objectDeleted || rowDeleted;
         }
 
         public PackageName Name { get; }
@@ -530,6 +541,25 @@ namespace SymbolSource.Contract.Storage.Aws
             }
         }
 
+        public async Task<IEnumerable<PackageName>> Query(string userName, PackageState packageState)
+        {
+            using (var client = new AmazonDynamoDBClient(_config))
+            {
+                var partitionKey = GetPartitionKey(packageState);
+
+                var table = Table.LoadTable(client, TableName);
+
+                var search = table.Query(partitionKey, new QueryFilter("UserName", QueryOperator.Equal, userName));
+
+                //TODO: need to handle paging
+                var set = await search.GetNextSetAsync();
+
+                var packageNames = set.Select(d => GetPackageName(d[IdKey]));
+
+                return packageNames;
+            }
+        }
+
         public async Task<bool> DeleteRowIfExists(PackageState state, PackageName name)
         {
             var partitionKey = GetPartitionKey(state);
@@ -579,12 +609,7 @@ namespace SymbolSource.Contract.Storage.Aws
         {
             using (var client = new AmazonS3Client(_config))
             {
-                var response = await client.ListBucketsAsync();
-                var bucket = response
-                    .Buckets
-                    .SingleOrDefault(b => b.BucketName == Name);
-
-                return bucket != null;
+                return await AmazonS3Util.DoesS3BucketExistAsync(client, Name);
             }
         }
 
@@ -594,9 +619,9 @@ namespace SymbolSource.Contract.Storage.Aws
             {
                 using (var client = new AmazonS3Client(_config))
                 {
-                    var response = await client.DeleteBucketAsync(Name);
+                    await AmazonS3Util.DeleteS3BucketWithObjectsAsync(client, Name);
 
-                    return response.HttpStatusCode == HttpStatusCode.NoContent;
+                    return true;
                 }
             }
             catch (AmazonS3Exception ex) when (ex.ErrorCode == "NoSuchBucket")

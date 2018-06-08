@@ -358,7 +358,7 @@ namespace SymbolSource.Contract.Tests
 
         [Theory]
         [InlineData(null, PackageState.New)]
-        [InlineData("feed-name", PackageState.New)]
+        //[InlineData("feed-name", PackageState.New)]
         public async void TestOverwriteUserName(string feedName, PackageState packageState)
         {
             var packageName = new PackageName("packageId", "1.0");
