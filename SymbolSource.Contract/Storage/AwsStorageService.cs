@@ -182,7 +182,7 @@ namespace SymbolSource.Contract.Storage.Aws
 
             //delete bucket
             var bucketExsisted = await _bucket.DeleteIfExistsAsync();
-
+            
             Debug.Assert(tableExisted == bucketExsisted);
 
             return tableExisted || bucketExsisted;
@@ -278,6 +278,7 @@ namespace SymbolSource.Contract.Storage.Aws
                 if (document["UserName"] != _userName)
                 {
                     await _bucket.DeleteObjectIfExistsAsync(GetPath(State, document["UserName"], Name));
+                    document["UserName"] = _userName;
                 }
             }
             else

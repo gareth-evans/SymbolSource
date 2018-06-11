@@ -25,7 +25,7 @@ namespace SymbolSource.Contract.Tests
         protected override IStorageService Storage { get; }
 
         [Fact
-            (Skip = "Should be run explicitly")
+           (Skip = "Should be run explicitly")
         ]
         public async Task DeleteAllBuckets()
         {
