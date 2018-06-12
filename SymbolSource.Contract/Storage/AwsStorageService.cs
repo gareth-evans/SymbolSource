@@ -5,6 +5,7 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Text.RegularExpressions;
+using System.Threading;
 using System.Threading.Tasks;
 using Amazon;
 using Amazon.DynamoDBv2;
@@ -288,8 +289,6 @@ namespace SymbolSource.Contract.Storage.Aws
 
             await _bucket.CreateIfNotExists();
             await _table.CreateIfNotExists();
-
-            
 
             await _table.InsertOrReplaceAsync(State, Name, document);
         }
@@ -638,6 +637,11 @@ namespace SymbolSource.Contract.Storage.Aws
                 using (var client = new AmazonS3Client(_config))
                 {
                     await client.PutBucketAsync(Name);
+
+                    while (!AmazonS3Util.DoesS3BucketExist(client, Name))
+                    {
+                        await Task.Delay(100);
+                    }
                 }
             }
             catch (AmazonS3Exception ex) when (ex.ErrorCode == "BucketAlreadyOwnedByYou")
@@ -721,6 +725,32 @@ namespace SymbolSource.Contract.Storage.Aws
         private readonly string _bucketName;
         private readonly string _path;
         private bool _disposed = false;
+
+
+        //public override void Flush()
+        //{
+        //    //Seek(0, SeekOrigin.Begin);
+
+        //    using (var client = new AmazonS3Client(_s3Config))
+        //    {
+        //        var request = new PutObjectRequest
+        //        {
+        //            BucketName = _bucketName,
+        //            AutoCloseStream = true,
+        //            Key = _path,
+        //            InputStream = this,
+        //            AutoResetStreamPosition = true
+        //        };
+
+        //        var response = client.PutObject(request);
+
+        //        //check if it exists after write
+
+
+
+        //        //_disposed = true;
+        //    }
+        //}
 
         public WriteS3ObjectOnDisposeStream(AmazonS3Config s3Config, string bucketName, string path)
         {
