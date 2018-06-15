@@ -50,9 +50,12 @@ namespace SymbolSource.Contract.Storage.Aws
             };
 
             var packageTable = new PackageTable(dynamoConfig, tableName);
-            var packageBucket = new PackageBucket(s3Config, bucketName);
 
-            return new AwsStorageFeed(bucketName, packageTable, packageBucket, s3Config, dynamoConfig);
+            return new AwsStorageFeed(
+                bucketName, 
+                packageTable, 
+                s3Config, 
+                dynamoConfig);
         }
 
         public IEnumerable<string> QueryFeeds()
@@ -108,22 +111,24 @@ namespace SymbolSource.Contract.Storage.Aws
     public class AwsStorageFeed : IStorageFeed
     {
         private readonly PackageTable _table;
-        private readonly PackageBucket _bucket;
+        private readonly PackageBucket _packageBucket;
         private readonly AmazonS3Config _s3Config;
         private readonly AmazonDynamoDBConfig _dynamoConfig;
+        private SourceBucket _sourceBucket;
 
         public AwsStorageFeed(
             string feedName,
             PackageTable table,
-            PackageBucket bucket,
             AmazonS3Config s3Config,
             AmazonDynamoDBConfig dynamoConfig)
         {
             _table = table;
-            _bucket = bucket;
             _s3Config = s3Config;
             _dynamoConfig = dynamoConfig;
+
             Name = feedName;
+            _packageBucket = new PackageBucket(s3Config, feedName);
+            _sourceBucket = new SourceBucket(s3Config, feedName);
         }
 
         public string Name { get; }
@@ -132,7 +137,7 @@ namespace SymbolSource.Contract.Storage.Aws
         {
             using (var client = new AmazonS3Client(_s3Config))
             {
-                var objects = client.ListObjects(_bucket.Name);
+                var objects = client.ListObjects(_packageBucket.Name);
 
                 return objects.S3Objects.Select(o => string.Join("/", o.Key.Split('/').Skip(2)));
             }
@@ -162,7 +167,7 @@ namespace SymbolSource.Contract.Storage.Aws
 
         public IPackageStorageItem GetPackage(string userName, PackageState packageState, PackageName packageName)
         {
-            return new AwsPackageStorageItem(this, packageName, packageState, _table, _bucket, _s3Config, _dynamoConfig,
+            return new AwsPackageStorageItem(this, packageName, packageState, _table, _packageBucket, _s3Config, _dynamoConfig,
                 userName);
         }
 
@@ -173,7 +178,7 @@ namespace SymbolSource.Contract.Storage.Aws
 
         public IPackageRelatedStorageItem GetSource(PackageName packageName, SourceName sourceName)
         {
-            throw new NotImplementedException();
+            return new AwsPackageRelatedStorageItem(this, packageName, sourceName, _sourceBucket, _sourceBucket.GetObjectReference(sourceName));
         }
 
         public async Task<bool> Delete()
@@ -182,7 +187,7 @@ namespace SymbolSource.Contract.Storage.Aws
             var tableExisted = await _table.DeleteIfExistsAsync();
 
             //delete bucket
-            var bucketExsisted = await _bucket.DeleteIfExistsAsync();
+            var bucketExsisted = await _packageBucket.DeleteIfExistsAsync();
             
             Debug.Assert(tableExisted == bucketExsisted);
 
@@ -392,6 +397,153 @@ namespace SymbolSource.Contract.Storage.Aws
 
             return Task.FromResult(newPackage);
         }
+    }
+
+    public class S3ObjectReference
+    {
+        private readonly AmazonS3Config _config;
+        private readonly string _bucketName;
+        private readonly string _path;
+
+        public S3ObjectReference(AmazonS3Config config, string bucketName, string path)
+        {
+            _config = config;
+            _bucketName = bucketName;
+            _path = path;
+        }
+
+        public async Task<bool> Exists()
+        {
+            try
+            {
+                using (var client = new AmazonS3Client(_config))
+                {
+                    var response = await client.GetObjectMetadataAsync(_bucketName, _path);
+                    return response.HttpStatusCode == HttpStatusCode.OK;
+                }
+            }
+            catch (AmazonS3Exception ex) when (ex.ErrorCode == "NotFound" || ex.ErrorCode == "NoSuchBucket")
+            {
+                return false;
+            }
+        }
+
+        public async Task<Stream> OpenReadAsync()
+        {
+            try
+            {
+                using (var client = new AmazonS3Client(_config))
+                {
+                    var response = await client.GetObjectAsync(_bucketName, _path);
+
+                    return response.ResponseStream;
+                }
+            }
+            catch (AmazonS3Exception ex) when (ex.ErrorCode == "NoSuchBucket" || ex.ErrorCode == "NoSuchKey")
+            {
+                return null;
+            }
+        }
+
+        public async Task<bool> DeleteIfExists()
+        {
+            try
+            {
+                if (!await Exists()) return false;
+
+                using (var client = new AmazonS3Client(_config))
+                {
+                    var response = await client.DeleteObjectAsync(_bucketName, _path);
+
+                    return response.HttpStatusCode == HttpStatusCode.NoContent;
+                }
+            }
+            catch (AmazonS3Exception ex) when (ex.ErrorCode == "NotFound" || ex.ErrorCode == "NoSuchBucket")
+            {
+                return false;
+            }
+        }
+
+        public Task<Stream> OpenWriteAsync()
+        {
+            Stream stream = new WriteS3ObjectOnDisposeStream(_config, _bucketName, _path);
+            return Task.FromResult(stream);
+        }
+    }
+
+    public class AwsPackageRelatedStorageItem : IPackageRelatedStorageItem
+    {
+        private readonly AwsStorageFeed feed;
+        private readonly PackageName packageName;
+        private readonly SourceName _sourceName;
+        private readonly SourceBucket _sourceBucket;
+        private readonly S3ObjectReference _objectReference;
+
+        public AwsPackageRelatedStorageItem(
+            AwsStorageFeed feed, 
+            PackageName packageName, 
+            SourceName sourceName,
+            SourceBucket sourceBucket,
+            S3ObjectReference objectReference)
+        {
+            this.feed = feed;
+            this.packageName = packageName;
+            _sourceName = sourceName;
+            _sourceBucket = sourceBucket;
+            _objectReference = objectReference;
+        }
+
+        public IStorageFeed Feed
+        {
+            get { return feed;  }
+        }
+
+        public bool CanGetUri
+        {
+            get { return false; }
+        }
+        public Task<bool> Exists()
+        {
+            return _objectReference.Exists();
+        }
+
+        public Task<Uri> GetUri()
+        {
+            throw new NotSupportedException();
+        }
+
+        public Task<Stream> Get()
+        {
+            return _objectReference.OpenReadAsync();
+        }
+
+        public async Task<Stream> Put()
+        {
+            await PreparePut();
+            return await _objectReference.OpenWriteAsync();
+        }
+
+        private async Task PreparePut()
+        {
+            await _sourceBucket.CreateIfNotExistsAsync();
+        }
+
+        public Task Get(Stream target)
+        {
+            throw new NotImplementedException();
+        }
+
+        public Task Put(Stream source)
+        {
+            throw new NotImplementedException();
+        }
+
+        public Task<bool> Delete()
+        {
+            return _objectReference.DeleteIfExists();
+        }
+
+        public IStorageSet<PackageName> PackageNames { get; }
     }
 
     public class PackageTable
@@ -690,7 +842,6 @@ namespace SymbolSource.Contract.Storage.Aws
         {
             using (var client = new AmazonS3Client(_config))
             {
-
                 var request = new CopyObjectRequest
                 {
                     SourceBucket = Name,
@@ -719,38 +870,47 @@ namespace SymbolSource.Contract.Storage.Aws
         }
     }
 
+    public class SourceBucket
+    {
+        private readonly string _bucketName;
+        private readonly AmazonS3Config _config;
+
+        public SourceBucket(AmazonS3Config config, string bucketName)
+        {
+            _bucketName = bucketName;
+            _config = config;
+        }
+
+        private static string GetPath(SourceName sourceName)
+        {
+            return $"src/{sourceName.FileName}/{sourceName.Hash}";
+        }
+
+        public S3ObjectReference GetObjectReference(SourceName sourceName)
+        {
+            return new S3ObjectReference(_config, _bucketName, GetPath(sourceName));
+        }
+
+        public async Task CreateIfNotExistsAsync()
+        {
+            using (var client = new AmazonS3Client(_config))
+            {
+                await client.PutBucketAsync(_bucketName);
+
+                while (!AmazonS3Util.DoesS3BucketExist(client, _bucketName))
+                {
+                    await Task.Delay(100);
+                }
+            }
+        }
+    }
+
     public class WriteS3ObjectOnDisposeStream : MemoryStream
     {
         private readonly AmazonS3Config _s3Config;
         private readonly string _bucketName;
         private readonly string _path;
         private bool _disposed = false;
-
-
-        //public override void Flush()
-        //{
-        //    //Seek(0, SeekOrigin.Begin);
-
-        //    using (var client = new AmazonS3Client(_s3Config))
-        //    {
-        //        var request = new PutObjectRequest
-        //        {
-        //            BucketName = _bucketName,
-        //            AutoCloseStream = true,
-        //            Key = _path,
-        //            InputStream = this,
-        //            AutoResetStreamPosition = true
-        //        };
-
-        //        var response = client.PutObject(request);
-
-        //        //check if it exists after write
-
-
-
-        //        //_disposed = true;
-        //    }
-        //}
 
         public WriteS3ObjectOnDisposeStream(AmazonS3Config s3Config, string bucketName, string path)
         {
