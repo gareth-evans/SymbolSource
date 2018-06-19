@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Linq.Expressions;
 using System.Net;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -10,7 +11,6 @@ using System.Threading.Tasks;
 using Amazon;
 using Amazon.DynamoDBv2;
 using Amazon.DynamoDBv2.DocumentModel;
-using Amazon.DynamoDBv2.Model;
 using Amazon.S3;
 using Amazon.S3.Model;
 using Amazon.S3.Util;
@@ -52,9 +52,9 @@ namespace SymbolSource.Contract.Storage.Aws
             var packageTable = new PackageTable(dynamoConfig, tableName);
 
             return new AwsStorageFeed(
-                bucketName, 
-                packageTable, 
-                s3Config, 
+                bucketName,
+                packageTable,
+                s3Config,
                 dynamoConfig);
         }
 
@@ -167,7 +167,8 @@ namespace SymbolSource.Contract.Storage.Aws
 
         public IPackageStorageItem GetPackage(string userName, PackageState packageState, PackageName packageName)
         {
-            return new AwsPackageStorageItem(this, packageName, packageState, _table, _packageBucket, _s3Config, _dynamoConfig,
+            return new AwsPackageStorageItem(this, packageName, packageState, _table, _packageBucket, _s3Config,
+                _dynamoConfig,
                 userName);
         }
 
@@ -178,7 +179,12 @@ namespace SymbolSource.Contract.Storage.Aws
 
         public IPackageRelatedStorageItem GetSource(PackageName packageName, SourceName sourceName)
         {
-            return new AwsPackageRelatedStorageItem(this, packageName, sourceName, _sourceBucket, _sourceBucket.GetObjectReference(sourceName));
+            return new AwsPackageRelatedStorageItem(
+                this,
+                _sourceBucket,
+                packageName,
+                new SourceRelatedPackageTable(_dynamoConfig, _table.TableName, sourceName), 
+                _sourceBucket.GetObjectReference(sourceName));
         }
 
         public async Task<bool> Delete()
@@ -188,7 +194,7 @@ namespace SymbolSource.Contract.Storage.Aws
 
             //delete bucket
             var bucketExsisted = await _packageBucket.DeleteIfExistsAsync();
-            
+
             Debug.Assert(tableExisted == bucketExsisted);
 
             return tableExisted || bucketExsisted;
@@ -245,7 +251,7 @@ namespace SymbolSource.Contract.Storage.Aws
 
         public Task<Uri> GetUri()
         {
-            throw new NotImplementedException();
+            throw new NotSupportedException();
         }
 
         public async Task<Stream> Get()
@@ -289,7 +295,7 @@ namespace SymbolSource.Contract.Storage.Aws
             }
             else
             {
-                document = new Document {["UserName"] = _userName};
+                document = new Document { ["UserName"] = _userName };
             }
 
             await _bucket.CreateIfNotExists();
@@ -473,35 +479,36 @@ namespace SymbolSource.Contract.Storage.Aws
 
     public class AwsPackageRelatedStorageItem : IPackageRelatedStorageItem
     {
-        private readonly AwsStorageFeed feed;
-        private readonly PackageName packageName;
-        private readonly SourceName _sourceName;
+        private readonly AwsStorageFeed _feed;
         private readonly SourceBucket _sourceBucket;
+        private readonly PackageName _packageName;
+        private readonly RelatedPackageTable _relatedPackageTable;
         private readonly S3ObjectReference _objectReference;
 
         public AwsPackageRelatedStorageItem(
-            AwsStorageFeed feed, 
-            PackageName packageName, 
-            SourceName sourceName,
+            AwsStorageFeed feed,
             SourceBucket sourceBucket,
+            PackageName packageName,
+            RelatedPackageTable relatedPackageTable,
             S3ObjectReference objectReference)
         {
-            this.feed = feed;
-            this.packageName = packageName;
-            _sourceName = sourceName;
+            _feed = feed;
             _sourceBucket = sourceBucket;
+            _packageName = packageName;
+            _relatedPackageTable = relatedPackageTable;
             _objectReference = objectReference;
         }
 
         public IStorageFeed Feed
         {
-            get { return feed;  }
+            get { return _feed; }
         }
 
         public bool CanGetUri
         {
             get { return false; }
         }
+
         public Task<bool> Exists()
         {
             return _objectReference.Exists();
@@ -526,6 +533,8 @@ namespace SymbolSource.Contract.Storage.Aws
         private async Task PreparePut()
         {
             await _sourceBucket.CreateIfNotExistsAsync();
+
+            await PackageNames.Add(_packageName);
         }
 
         public Task Get(Stream target)
@@ -538,72 +547,76 @@ namespace SymbolSource.Contract.Storage.Aws
             throw new NotImplementedException();
         }
 
-        public Task<bool> Delete()
+        public async Task<bool> Delete()
         {
-            return _objectReference.DeleteIfExists();
+            if (_packageName == null)
+                throw new InvalidOperationException();
+
+            await PackageNames.Remove(_packageName);
+
+            if (!(await PackageNames.List()).Any())
+                return await _objectReference.DeleteIfExists();
+
+            return false;
         }
 
-        public IStorageSet<PackageName> PackageNames { get; }
+        public IStorageSet<PackageName> PackageNames
+        {
+            get
+            {
+                return new AwsRelatedPackageNameSet(_relatedPackageTable);
+            }
+        }
     }
 
-    public class PackageTable
+    public class AwsRelatedPackageNameSet : IStorageSet<PackageName>
     {
-        private const string StateKey = "state";
-        private const string IdKey = "id";
+        private readonly RelatedPackageTable _table;
 
-        private readonly AmazonDynamoDBConfig _config;
-        public string TableName { get; }
-
-        public PackageTable(AmazonDynamoDBConfig config, string tableName)
+        public AwsRelatedPackageNameSet(RelatedPackageTable table)
         {
-            _config = config;
-            TableName = tableName;
+            _table = table;
         }
 
-        public async Task<Document> RetrieveAsync(PackageState packageState, PackageName packageName)
+        public async Task Add(PackageName item)
+        {
+            await _table.CreateIfNotExists();
+            await _table.InsertOrReplaceAsync(item);
+        }
+
+        public Task Remove(PackageName item)
+        {
+            return _table.DeleteIfExistsAsync(item);
+        }
+
+        public Task<IEnumerable<PackageName>> List()
+        {
+            return _table.Query();
+        }
+    }
+
+    public class PackageTable : DynamoTable
+    {
+        public PackageTable(
+            AmazonDynamoDBConfig config, 
+            string tableName) : base(config, tableName)
+        {
+        }
+
+        public Task<Document> RetrieveAsync(PackageState packageState, PackageName packageName)
         {
             var partitionKey = GetPartitionKey(packageState);
             var rangeKey = GetRangeKey(packageName);
 
-            try
-            {
-                using (var client = new AmazonDynamoDBClient(_config))
-                {
-                    var table = Table.LoadTable(client, TableName);
-                    var document = await table.GetItemAsync(partitionKey, rangeKey);
-
-                    return document;
-                }
-            }
-            catch (ResourceNotFoundException)
-            {
-                return null;
-            }
+            return RetrieveAsync(partitionKey, rangeKey);
         }
 
-        public async Task<bool> DeleteIfExistsAsync()
-        {
-            using (var client = new AmazonDynamoDBClient(_config))
-            {
-                try
-                {
-                    var response = await client.DeleteTableAsync(TableName);
-
-                    return response.HttpStatusCode == HttpStatusCode.OK;
-                }
-                catch (ResourceNotFoundException)
-                {
-                    return false;
-                }
-            }
-        }
-
-        private static string GetPartitionKey(PackageState packageState)
+        protected static string GetPartitionKey(PackageState packageState)
         {
             return $"pkg*{packageState.ToString().ToLower()}";
         }
 
-        private static string GetRangeKey(PackageName packageName)
+        protected static string GetRangeKey(PackageName packageName)
         {
             return $"{packageName.Id}*{packageName.Version}";
         }
@@ -614,64 +627,12 @@ namespace SymbolSource.Contract.Storage.Aws
             return new PackageName(rowKeyParts[0], rowKeyParts[1]);
         }
 
-        public async Task InsertOrReplaceAsync(PackageState newState, PackageName newName, Document packageEntity)
+        public Task InsertOrReplaceAsync(PackageState newState, PackageName newName, Document packageEntity)
         {
             packageEntity[StateKey] = GetPartitionKey(newState);
             packageEntity[IdKey] = GetRangeKey(newName);
 
-            using (var client = new AmazonDynamoDBClient(_config))
-            {
-                var table = Table.LoadTable(client, TableName);
-
-                await table.UpdateItemAsync(packageEntity);
-            }
-        }
-
-        public async Task CreateIfNotExists()
-        {
-            if (await Exists()) return;
-
-            using (var client = new AmazonDynamoDBClient(_config))
-            {
-                var attributeDefinitions = new List<AttributeDefinition>
-                {
-                    new AttributeDefinition {AttributeName = StateKey, AttributeType = ScalarAttributeType.S},
-                    new AttributeDefinition {AttributeName = IdKey, AttributeType = ScalarAttributeType.S}
-                };
-                var keySchemaElements = new List<KeySchemaElement>
-                {
-                    new KeySchemaElement {AttributeName = StateKey, KeyType = KeyType.HASH},
-                    new KeySchemaElement {AttributeName = IdKey, KeyType = KeyType.RANGE}
-                };
-
-                var request = new CreateTableRequest
-                {
-                    TableName = TableName,
-                    AttributeDefinitions = attributeDefinitions,
-                    KeySchema = keySchemaElements,
-                    ProvisionedThroughput = new ProvisionedThroughput(5, 1)
-                };
-
-                await client.CreateTableAsync(request);
-
-                DescribeTableResponse describeTableResponse = null;
-
-                do
-                {
-                    describeTableResponse = await client.DescribeTableAsync(TableName);
-                    await Task.Delay(200);
-                } while (describeTableResponse.Table.TableStatus != TableStatus.ACTIVE);
-            }
-        }
-
-        public async Task<bool> Exists()
-        {
-            using (var client = new AmazonDynamoDBClient(_config))
-            {
-                var tableResponse = await client.ListTablesAsync();
-
-                return tableResponse.TableNames.Exists(name => string.Equals(name, TableName));
-            }
+            return InsertOrReplaceAsync(packageEntity);
         }
 
         public async Task<IEnumerable<PackageName>> Query(PackageState packageState)
@@ -712,36 +673,85 @@ namespace SymbolSource.Contract.Storage.Aws
             }
         }
 
-        public async Task<bool> DeleteRowIfExists(PackageState state, PackageName name)
+        public Task<bool> DeleteRowIfExists(PackageState state, PackageName name)
         {
             var partitionKey = GetPartitionKey(state);
             var rangeKey = GetRangeKey(name);
 
-            try
-            {
-                using (var client = new AmazonDynamoDBClient(_config))
-                {
-                    var request = new DeleteItemRequest
-                    {
-                        ReturnItemCollectionMetrics = ReturnItemCollectionMetrics.SIZE,
-                        TableName = TableName,
-                        Key = new Dictionary<string, AttributeValue>
-                        {
-                            {StateKey, new AttributeValue(partitionKey)},
-                            {IdKey, new AttributeValue(rangeKey)}
-                        },
-                        ReturnValues = ReturnValue.ALL_OLD
-                    };
+            return DeleteRowIfExists(partitionKey, rangeKey);
+        }
+    }
 
-                    var response = await client.DeleteItemAsync(request);
+    public abstract class RelatedPackageTable : DynamoTable
+    {
+        private readonly string _partitionKey;
 
-                    return response.Attributes.Count > 0;
-                }
-            }
-            catch (ResourceNotFoundException)
+        protected RelatedPackageTable(
+            AmazonDynamoDBConfig config, 
+            string tableName,
+            string partitionKey) : base(config, tableName)
+        {
+            _partitionKey = partitionKey;
+        }
+
+        public static string GetRangeKey(PackageName packageName)
+        {
+            return $"{packageName.Id}*{packageName.Version}";
+        }
+
+        public Task InsertOrReplaceAsync(PackageName name)
+        {
+            var packageEntity = new Document
             {
-                return false;
-            }
+                [StateKey] = _partitionKey,
+                [IdKey] = GetRangeKey(name)
+            };
+
+            return base.InsertOrReplaceAsync(packageEntity);
+        }
+
+        public Task<IEnumerable<PackageName>> Query()
+        {
+            var result = Query(_partitionKey).Select(e => GetPackageName(e[IdKey]));
+
+            return Task.FromResult(result);
+        }
+
+        internal static PackageName GetPackageName(string rowKey)
+        {
+            var rowKeyParts = rowKey.Split('*');
+            return new PackageName(rowKeyParts[0], rowKeyParts[1]);
+        }
+
+        internal Task DeleteIfExistsAsync(PackageName item)
+        {
+            return DeleteRowIfExists(_partitionKey, GetRangeKey(item));
+        }
+    }
+
+    public class SymbolRelatedPackageTable : RelatedPackageTable
+    {
+        public SymbolRelatedPackageTable(AmazonDynamoDBConfig config, string tableName, SymbolName symbolName)
+            : base(config, tableName, GetPartitionKey(symbolName))
+        {
+        }
+
+        private static string GetPartitionKey(SymbolName symbolName)
+        {
+            return $"pdb*{symbolName.ImageName}*{symbolName.SymbolHash}";
+        }
+    }
+
+    public class SourceRelatedPackageTable : RelatedPackageTable
+    {
+        public SourceRelatedPackageTable(AmazonDynamoDBConfig config, string tableName, SourceName sourceName) 
+            : base(config, tableName, GetPartitionKey(sourceName))
+        {
+        }
+
+        private static string GetPartitionKey(SourceName sourceName)
+        {
+            return $"src*{sourceName.FileName}*{sourceName.Hash}";
         }
     }
 
@@ -891,15 +901,22 @@ namespace SymbolSource.Contract.Storage.Aws
             return new S3ObjectReference(_config, _bucketName, GetPath(sourceName));
         }
 
+        //TODO: base class for this?
         public async Task CreateIfNotExistsAsync()
         {
             using (var client = new AmazonS3Client(_config))
             {
-                await client.PutBucketAsync(_bucketName);
-
-                while (!AmazonS3Util.DoesS3BucketExist(client, _bucketName))
+                try
                 {
-                    await Task.Delay(100);
+                    await client.PutBucketAsync(_bucketName);
+
+                    while (!AmazonS3Util.DoesS3BucketExist(client, _bucketName))
+                    {
+                        await Task.Delay(100);
+                    }
+                }
+                catch (AmazonS3Exception ex) when (ex.ErrorCode == "BucketAlreadyOwnedByYou")
+                {
                 }
             }
         }

@@ -1,15 +1,12 @@
 ﻿using System;
 using System.IO;
-using System.Linq.Expressions;
 using System.Threading.Tasks;
 using Amazon;
 using Amazon.DynamoDBv2;
 using Amazon.S3;
-using Amazon.S3.Model;
 using SymbolSource.Contract.Storage;
 using SymbolSource.Contract.Storage.Aws;
 using Xunit;
-using Xunit.Abstractions;
 
 namespace SymbolSource.Contract.Tests
 {

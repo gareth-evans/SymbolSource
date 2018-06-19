@@ -255,6 +255,7 @@
     <Compile Include="Security\MyGetOrgSecurityConfiguration.cs" />
     <Compile Include="Security\NullSecurityConfiguration.cs" />
     <Compile Include="Storage\AwsStorageService.cs" />
+    <Compile Include="Storage\Aws\DynamoTable.cs" />
     <Compile Include="Storage\AzureStorageService.cs" />
     <Compile Include="Storage\Azure\AzureQueryCache.cs" />
     <Compile Include="Storage\Azure\AzureTable.cs" />
