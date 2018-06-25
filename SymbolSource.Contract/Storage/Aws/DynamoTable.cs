@@ -1,4 +1,5 @@
 ﻿using System.Collections.Generic;
+using System.Linq;
 using System.Net;
 using System.Threading.Tasks;
 using Amazon.DynamoDBv2;
@@ -148,19 +149,31 @@ namespace SymbolSource.Contract.Storage.Aws
         {
             using (var client = new AmazonDynamoDBClient(_config))
             {
-                var table = Table.LoadTable(client, TableName);
-
-                //TODO: empty query filter here, can we pass something in to make it a bit smarter?
-                var search = table.Query(partitionKey, new QueryFilter());
-
-                do
+                try
                 {
-                    foreach (var document in search.GetNextSet())
-                    {
-                        yield return document;
-                    }
-                } while (!search.IsDone);
+                    var table = Table.LoadTable(client, TableName);
+
+                    //TODO: empty query filter here, can we pass something in to make it a bit smarter?
+                    var search = table.Query(partitionKey, new QueryFilter());
+
+                    return IterateSearch(search).ToArray(); //TODO: ToArray as client is disposed, can this be done in a nicer way? Perhaps dispose the client once we reach the end of the search
+                }
+                catch (ResourceNotFoundException)
+                {
+                    return Enumerable.Empty<Document>();
+                }
             }
+        }
+
+        private static IEnumerable<Document> IterateSearch(Search search)
+        {
+            do
+            {
+                foreach (var document in search.GetNextSet())
+                {
+                    yield return document;
+                }
+            } while (!search.IsDone);
         }
     }
 }

@@ -115,6 +115,7 @@ namespace SymbolSource.Contract.Storage.Aws
         private readonly AmazonS3Config _s3Config;
         private readonly AmazonDynamoDBConfig _dynamoConfig;
         private SourceBucket _sourceBucket;
+        private SymbolBucket _symbolBucket;
 
         public AwsStorageFeed(
             string feedName,
@@ -129,6 +130,7 @@ namespace SymbolSource.Contract.Storage.Aws
             Name = feedName;
             _packageBucket = new PackageBucket(s3Config, feedName);
             _sourceBucket = new SourceBucket(s3Config, feedName);
+            _symbolBucket = new SymbolBucket(s3Config, feedName);
         }
 
         public string Name { get; }
@@ -174,14 +176,18 @@ namespace SymbolSource.Contract.Storage.Aws
 
         public IPackageRelatedStorageItem GetSymbol(PackageName packageName, SymbolName symbolName)
         {
-            throw new NotImplementedException();
+            return new AwsPackageRelatedStorageItem(
+                this,
+                packageName,
+                new SymbolRelatedPackageTable(_dynamoConfig, _table.TableName, symbolName),
+                _symbolBucket.GetObjectReference(symbolName)               
+                );
         }
 
         public IPackageRelatedStorageItem GetSource(PackageName packageName, SourceName sourceName)
         {
             return new AwsPackageRelatedStorageItem(
                 this,
-                _sourceBucket,
                 packageName,
                 new SourceRelatedPackageTable(_dynamoConfig, _table.TableName, sourceName), 
                 _sourceBucket.GetObjectReference(sourceName));
@@ -475,25 +481,37 @@ namespace SymbolSource.Contract.Storage.Aws
             Stream stream = new WriteS3ObjectOnDisposeStream(_config, _bucketName, _path);
             return Task.FromResult(stream);
         }
+
+        public async Task CreateBucketIfNotExistsAsync()
+        {
+            using (var client = new AmazonS3Client(_config))
+            {
+                if(AmazonS3Util.DoesS3BucketExist(client, _bucketName)) return;
+
+                await client.PutBucketAsync(_bucketName);
+
+                while (!AmazonS3Util.DoesS3BucketExist(client, _bucketName))
+                {
+                    await Task.Delay(100);
+                }
+            }
+        }
     }
 
     public class AwsPackageRelatedStorageItem : IPackageRelatedStorageItem
     {
         private readonly AwsStorageFeed _feed;
-        private readonly SourceBucket _sourceBucket;
         private readonly PackageName _packageName;
         private readonly RelatedPackageTable _relatedPackageTable;
         private readonly S3ObjectReference _objectReference;
 
         public AwsPackageRelatedStorageItem(
             AwsStorageFeed feed,
-            SourceBucket sourceBucket,
             PackageName packageName,
             RelatedPackageTable relatedPackageTable,
             S3ObjectReference objectReference)
         {
             _feed = feed;
-            _sourceBucket = sourceBucket;
             _packageName = packageName;
             _relatedPackageTable = relatedPackageTable;
             _objectReference = objectReference;
@@ -532,7 +550,10 @@ namespace SymbolSource.Contract.Storage.Aws
 
         private async Task PreparePut()
         {
-            await _sourceBucket.CreateIfNotExistsAsync();
+            if (_packageName == null)
+                throw new InvalidOperationException();
+
+            await _objectReference.CreateBucketIfNotExistsAsync();
 
             await PackageNames.Add(_packageName);
         }
@@ -880,28 +901,24 @@ namespace SymbolSource.Contract.Storage.Aws
         }
     }
 
-    public class SourceBucket
+    public abstract class Bucket<T>
     {
         private readonly string _bucketName;
         private readonly AmazonS3Config _config;
 
-        public SourceBucket(AmazonS3Config config, string bucketName)
+        protected Bucket(AmazonS3Config config, string bucketName)
         {
             _bucketName = bucketName;
             _config = config;
         }
 
-        private static string GetPath(SourceName sourceName)
+        protected abstract string GetPath(T sourceName);
+
+        public S3ObjectReference GetObjectReference(T name)
         {
-            return $"src/{sourceName.FileName}/{sourceName.Hash}";
+            return new S3ObjectReference(_config, _bucketName, GetPath(name));
         }
 
-        public S3ObjectReference GetObjectReference(SourceName sourceName)
-        {
-            return new S3ObjectReference(_config, _bucketName, GetPath(sourceName));
-        }
-
-        //TODO: base class for this?
         public async Task CreateIfNotExistsAsync()
         {
             using (var client = new AmazonS3Client(_config))
@@ -919,6 +936,30 @@ namespace SymbolSource.Contract.Storage.Aws
                 {
                 }
             }
+        }
+    }
+
+    public class SourceBucket : Bucket<SourceName>
+    {
+        public SourceBucket(AmazonS3Config config, string bucketName) : base(config, bucketName)
+        {
+        }
+
+        protected override string GetPath(SourceName sourceName)
+        {
+            return $"src/{sourceName.FileName}/{sourceName.Hash}";
+        }
+    }
+
+    public class SymbolBucket : Bucket<SymbolName>
+    {
+        public SymbolBucket(AmazonS3Config config, string bucketName) : base(config, bucketName)
+        {
+        }
+
+        protected override string GetPath(SymbolName symbolName)
+        {
+            return $"pdb/{symbolName.ImageName}/{symbolName.SymbolHash}";
         }
     }
 
